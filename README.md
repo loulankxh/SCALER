@@ -21,7 +21,7 @@ cmake .. && make -j
 2. Run index construction (the time of each step will show in the last line of terminal output)
    a. Partition: build/executeDiskPartition
      ```
-     E.g., ./executeDiskPartition --data_path “path_to_your_data” --base_folder “path_to_store_data_partitions” –M 16 -R 64 -L 128 -W 2 -E 1.2 -T 80
+     E.g., ./executeDiskPartition --data_path “path_to_your_data” --base_folder “path_to_store_data_partitions” -M 16 -R 64 -L 128 -W 2 -E 1.2 -T 80
      ```
    b. Build:
       1. Run [src/indexBuild/generateConfig.sh](https://github.com/loulankxh/scaleGANN/blob/main/src/indexBuild/generateConfig.sh) to generate build configuration
