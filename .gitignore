@@ -58,17 +58,24 @@ compile_commands.json
 .clangd/
 
 
-# Dataset files
+# Build files
+build/
+bin/
+lib/
+
+# Dataset and Trace files
 *.fbin
 *.u8bin
 *.ibin
 *.bvecs
 *.ivecs
 *.fvecs
+*.csv
 dataset/
 
-# Build files
-build/
+# Logs
+*.log
+rmm_log.txt
 
 # other files
 DiskANN_mainRepo/
