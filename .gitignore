@@ -62,6 +62,8 @@ compile_commands.json
 build/
 bin/
 lib/
+test_Simulation
+test_TaskBroker
 
 # Dataset and Trace files
 *.fbin
