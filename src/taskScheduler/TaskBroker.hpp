@@ -6,6 +6,7 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <chrono>
 
 
 struct ShardTask {
@@ -17,10 +18,7 @@ struct ShardTask {
     
     Status status = PENDING;
     int gpu_id = -1;
-    
-    // Dependency tracking
-    uint32_t in_degree = 0; 
-    std::vector<uint32_t> children;
+    int retry_count = 0;
 
     ShardTask(uint32_t id, size_t n, uint32_t d, uint32_t deg) 
         : id(id) {
@@ -34,8 +32,6 @@ public:
     TaskBroker() = default;
 
     void addTask(uint32_t id, size_t n, uint32_t d, uint32_t deg);
-
-    void addDependency(uint32_t parent_id, uint32_t child_id);
 
     std::vector<uint32_t> Scheduler(int gpu_id, size_t capacity, float alpha = 0.9f);
 
@@ -55,6 +51,12 @@ private:
     std::map<uint32_t, std::shared_ptr<ShardTask>> tasks;
     std::set<int> active_gpus;
     std::mutex mtx;
+
+    // Performance tracking
+    bool has_started = false;
+    std::chrono::high_resolution_clock::time_point start_time;
+    std::chrono::high_resolution_clock::time_point end_time;
+
     void refreshReadyStatus();
     std::vector<uint32_t> collectReadyTasks();
     void prioritizeTasks(std::vector<uint32_t>& task_ids);

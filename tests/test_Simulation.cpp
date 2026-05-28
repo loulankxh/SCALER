@@ -10,12 +10,7 @@ int main() {
         broker.addTask(i, 1000000, 128, 32); 
     }
 
-    // Add some dependencies to make it interesting
-    for (uint32_t i = 0; i < 90; ++i) {
-        broker.addDependency(i, i + 10);
-    }
-
-    TraceSimulator simulator(broker, "../p3-trace.csv");
+    TraceSimulator simulator(broker, "tests/p3-trace.csv");
     simulator.run();
 
     return 0;

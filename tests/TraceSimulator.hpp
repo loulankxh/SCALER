@@ -99,6 +99,7 @@ private:
         while(it != running_pool.end()) {
             if (it->gpu_id == gpu_id) {
                 Logger::spot(gpu_id, "Task {} interrupted.", it->task_id);
+                broker.updateStatus(it->task_id, ShardTask::READY);
                 it = running_pool.erase(it);
             } else {
                 ++it;
@@ -126,6 +127,7 @@ private:
             auto block = broker.Scheduler(gpu_id, 16000000000ULL);
             for (uint32_t tid : block) {
                 long duration = (long)(broker.getWorkWeight(tid) / 10000.0f); 
+
                 running_pool.push_back({tid, gpu_id, current_time + duration});
                 Logger::task(tid, "Started on GPU {} ({}ms)", gpu_id, duration);
             }
