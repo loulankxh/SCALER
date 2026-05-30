@@ -111,6 +111,14 @@ float TaskBroker::getWorkWeight(uint32_t id) {
     return 0.0f;
 }
 
+size_t TaskBroker::getTaskN(uint32_t id) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (tasks.count(id)) {
+        return tasks[id]->n;
+    }
+    return 0;
+}
+
 bool TaskBroker::isAllDone() {
     std::lock_guard<std::mutex> lock(mtx);
     if (tasks.empty()) return false;

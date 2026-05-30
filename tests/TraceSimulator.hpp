@@ -21,13 +21,25 @@ struct RunningTask {
     uint32_t task_id;
     int gpu_id;
     long finish_time;
+    size_t npts;
 };
 
 class TraceSimulator {
 public:
-    TraceSimulator(TaskBroker& broker, const std::string& trace_file) 
+    TraceSimulator(TaskBroker& broker, const std::string& trace_file, const std::string& build_time_file = "") 
         : broker(broker), current_time(0), event_idx(0) {
         loadTrace(trace_file);
+        if (!build_time_file.empty()) {
+            loadBuildTimes(build_time_file);
+        }
+        event_log.open("tests/sim_events.csv");
+        event_log << "timestamp,event_type,task_id,gpu_id,npts\n";
+    }
+
+    ~TraceSimulator() {
+        if (event_log.is_open()) {
+            event_log.close();
+        }
     }
 
     void run() {
@@ -59,6 +71,8 @@ private:
     std::vector<TraceEvent> events;
     std::set<int> active_nodes;
     std::vector<RunningTask> running_pool;
+    std::map<uint32_t, long> actual_build_times;
+    std::ofstream event_log;
     long current_time;
     size_t event_idx;
 
@@ -67,15 +81,47 @@ private:
         if (!file.is_open()) return;
         std::string line;
         while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            if (line.back() == '\r') line.pop_back();
+
             std::stringstream ss(line);
             std::string ts_str, action, node_str;
             if (std::getline(ss, ts_str, ',') && std::getline(ss, action, ',') && std::getline(ss, node_str, ',')) {
                 TraceEvent e;
-                e.timestamp = std::stol(ts_str);
+                // Scale trace down by 10x to bring interruptions into build-time range
+                e.timestamp = std::stol(ts_str) / 10; 
                 e.action = action;
-                e.node_id = std::stoi(node_str.substr(4));
-                events.push_back(e);
+                
+                size_t first_digit = node_str.find_first_of("0123456789");
+                if (first_digit != std::string::npos) {
+                    e.node_id = std::stoi(node_str.substr(first_digit));
+                    events.push_back(e);
+                }
             }
+        }
+    }
+
+    void loadBuildTimes(const std::string& file_path) {
+        std::ifstream file(file_path);
+        if (!file.is_open()) return;
+        std::string line;
+        std::getline(file, line); 
+        while (std::getline(file, line)) {
+            std::stringstream ss(line);
+            uint32_t id;
+            int gpu;
+            double time_s;
+            // Now comma-separated after our sed command
+            char comma;
+            if (ss >> id >> comma >> gpu >> comma >> time_s) {
+                actual_build_times[id] = (long)(time_s * 1000.0);
+            }
+        }
+    }
+
+    void logEvent(const std::string& type, uint32_t task_id, int gpu_id, size_t npts) {
+        if (event_log.is_open()) {
+            event_log << current_time << "," << type << "," << task_id << "," << gpu_id << "," << npts << "\n";
         }
     }
 
@@ -99,6 +145,7 @@ private:
         while(it != running_pool.end()) {
             if (it->gpu_id == gpu_id) {
                 Logger::spot(gpu_id, "Task {} interrupted.", it->task_id);
+                logEvent("INTERRUPT", it->task_id, gpu_id, it->npts);
                 broker.updateStatus(it->task_id, ShardTask::READY);
                 it = running_pool.erase(it);
             } else {
@@ -112,6 +159,7 @@ private:
         while (it != running_pool.end()) {
             if (it->finish_time <= current_time) {
                 Logger::task(it->task_id, "Finished on GPU {} at {}ms", it->gpu_id, current_time);
+                logEvent("FINISH", it->task_id, it->gpu_id, it->npts);
                 broker.updateStatus(it->task_id, ShardTask::COMPLETED);
                 it = running_pool.erase(it);
             } else {
@@ -126,9 +174,16 @@ private:
 
             auto block = broker.Scheduler(gpu_id, 16000000000ULL);
             for (uint32_t tid : block) {
-                long duration = (long)(broker.getWorkWeight(tid) / 10000.0f); 
+                long duration = 0;
+                size_t npts = broker.getTaskN(tid);
+                if (actual_build_times.count(tid)) {
+                    duration = actual_build_times[tid];
+                } else {
+                    duration = (long)(broker.getWorkWeight(tid) / 10000.0f);
+                }
 
-                running_pool.push_back({tid, gpu_id, current_time + duration});
+                running_pool.push_back({tid, gpu_id, current_time + duration, npts});
+                logEvent("START", tid, gpu_id, npts);
                 Logger::task(tid, "Started on GPU {} ({}ms)", gpu_id, duration);
             }
         }

@@ -13,6 +13,7 @@ struct ShardTask {
     enum Status { PENDING, READY, RUNNING, COMPLETED, FAILED };
 
     uint32_t id;
+    size_t n;
     size_t vram_req;
     float work_weight;
     
@@ -21,7 +22,7 @@ struct ShardTask {
     int retry_count = 0;
 
     ShardTask(uint32_t id, size_t n, uint32_t d, uint32_t deg) 
-        : id(id) {
+        : id(id), n(n) {
         vram_req = (n * d * 4) + (size_t)(n * deg * 6);
         work_weight = (float)n * d * deg;
     }
@@ -40,6 +41,8 @@ public:
     ShardTask::Status getTaskStatus(uint32_t id);
 
     float getWorkWeight(uint32_t id);
+
+    size_t getTaskN(uint32_t id);
 
     void removeGPU(int gpu_id);
 
