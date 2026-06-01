@@ -22,7 +22,7 @@ int main() {
         }
     }
 
-    TraceSimulator simulator(broker, "tests/p3-trace.csv", "tests/build_time.csv");
+    TraceSimulator simulator(broker, "tests/p3-trace.csv", "tests/build_time.csv", 4, 0, 0.1);
     simulator.run();
 
     return 0;

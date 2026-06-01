@@ -26,8 +26,8 @@ struct RunningTask {
 
 class TraceSimulator {
 public:
-    TraceSimulator(TaskBroker& broker, const std::string& trace_file, const std::string& build_time_file = "") 
-        : broker(broker), current_time(0), event_idx(0) {
+    TraceSimulator(TaskBroker& broker, const std::string& trace_file, const std::string& build_time_file = "", int node_filter_step = 1, long startup_delay_ms = 0, double time_scale = 1.0) 
+        : broker(broker), current_time(0), event_idx(0), node_filter_step(node_filter_step), startup_delay_ms(startup_delay_ms), time_scale(time_scale) {
         loadTrace(trace_file);
         if (!build_time_file.empty()) {
             loadBuildTimes(build_time_file);
@@ -75,6 +75,9 @@ private:
     std::ofstream event_log;
     long current_time;
     size_t event_idx;
+    int node_filter_step;
+    long startup_delay_ms;
+    double time_scale;
 
     void loadTrace(const std::string& file_path) {
         std::ifstream file(file_path);
@@ -88,14 +91,17 @@ private:
             std::string ts_str, action, node_str;
             if (std::getline(ss, ts_str, ',') && std::getline(ss, action, ',') && std::getline(ss, node_str, ',')) {
                 TraceEvent e;
-                // Scale trace down by 10x to bring interruptions into build-time range
-                e.timestamp = std::stol(ts_str) / 10; 
+                // Apply time_scale to timestamps to compress/expand events
+                e.timestamp = (long)(std::stol(ts_str) * time_scale); 
                 e.action = action;
                 
                 size_t first_digit = node_str.find_first_of("0123456789");
                 if (first_digit != std::string::npos) {
                     e.node_id = std::stoi(node_str.substr(first_digit));
-                    events.push_back(e);
+                    // Only include the node if it matches our sampling step
+                    if (e.node_id % node_filter_step == 0) {
+                        events.push_back(e);
+                    }
                 }
             }
         }
@@ -109,11 +115,9 @@ private:
         while (std::getline(file, line)) {
             std::stringstream ss(line);
             uint32_t id;
-            int gpu;
             double time_s;
-            // Now comma-separated after our sed command
             char comma;
-            if (ss >> id >> comma >> gpu >> comma >> time_s) {
+            if (ss >> id >> comma >> time_s) {
                 actual_build_times[id] = (long)(time_s * 1000.0);
             }
         }
@@ -169,6 +173,8 @@ private:
     }
 
     void scheduleNewTasks() {
+        if (current_time < startup_delay_ms) return;
+
         for (int gpu_id : active_nodes) {
             if (isGPUBusy(gpu_id)) continue;
 

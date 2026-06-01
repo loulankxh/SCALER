@@ -1,19 +1,21 @@
 cmake_minimum_required(VERSION 3.26.4 FATAL_ERROR)
 
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
+
 project(
     ScaleGANN
     LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
 
 # set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fopenmp -Xcompiler=-mavx2 -Xcompiler=-mfma -Xcompiler=-msse4.2")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -msse2 -ftree-vectorize -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_AVX2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -msse2 -ftree-vectorize -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_AVX2 -fPIC")
 
 find_package(Boost REQUIRED COMPONENTS program_options)
 find_package(fmt REQUIRED)
 find_package(benchmark REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 # Try to find MKL
 set(MKL_ROOT $ENV{CONDA_PREFIX} CACHE PATH "MKL Root")
@@ -23,13 +25,15 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/DiskANN/include
     ${PROJECT_SOURCE_DIR}/src
     ${Boost_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}
+    /home/sakshis/anaconda3/envs/scalegann_env/include
 )
 
-# RAFT/CAGRA include paths (usually in conda include if installed via rapidsai)
-if(DEFINED ENV{CONDA_PREFIX})
-    include_directories($ENV{CONDA_PREFIX}/include)
-    include_directories($ENV{CONDA_PREFIX}/include/rapids)
-    include_directories($ENV{CONDA_PREFIX}/include/rapids/libcudacxx)
+# RAFT/CAGRA include paths
+if(CMAKE_PREFIX_PATH)
+    include_directories(BEFORE SYSTEM ${CMAKE_PREFIX_PATH}/include)
+    include_directories(BEFORE SYSTEM ${CMAKE_PREFIX_PATH}/include/rapids)
+    include_directories(BEFORE SYSTEM ${CMAKE_PREFIX_PATH}/include/rapids/libcudacxx)
 endif()
 
 set(DISKANN_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/DiskANN/src)
@@ -111,7 +115,7 @@ list(TRANSFORM SEARCH_DISKANN_APP  PREPEND ${SCALEGANN_APP_PATH}/)
 
 
 set(COMMON_LIBS
-    cudart
+    CUDA::cudart
     dl
     benchmark::benchmark
     pthread
