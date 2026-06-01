@@ -72,7 +72,6 @@ test_TaskBroker
 *.bvecs
 *.ivecs
 *.fvecs
-*.csv
 dataset/
 
 # Logs
