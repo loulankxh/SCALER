@@ -50,10 +50,14 @@ public:
 
     bool isAllDone();
 
+    void setRandomMode(bool mode) { random_mode = mode; }
+
 private:
     std::map<uint32_t, std::shared_ptr<ShardTask>> tasks;
     std::set<int> active_gpus;
     std::mutex mtx;
+
+    bool random_mode = false;
 
     // Performance tracking
     bool has_started = false;

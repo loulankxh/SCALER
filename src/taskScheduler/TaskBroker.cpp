@@ -39,12 +39,21 @@ std::vector<uint32_t> TaskBroker::collectReadyTasks() {
     return ready_ids;
 }
 
+#include <random>
+
 void TaskBroker::prioritizeTasks(std::vector<uint32_t>& task_ids) {
+    if (random_mode) {
+        static std::random_device rd;
+        static std::mt19937 g(rd());
+        std::shuffle(task_ids.begin(), task_ids.end(), g);
+        return;
+    }
+
     std::sort(task_ids.begin(), task_ids.end(), [&](uint32_t a, uint32_t b) {
         if (tasks[a]->retry_count != tasks[b]->retry_count) {
             return tasks[a]->retry_count > tasks[b]->retry_count;
         }
-        return tasks[a]->work_weight > tasks[b]->work_weight;
+        return a < b; // Neutral tie-breaker (ID-based FIFO)
     });
 }
 
