@@ -1,3 +1,4 @@
+timestamp,event_type,gpu_id
 0,add,node1
 0,add,node2
 0,add,node3

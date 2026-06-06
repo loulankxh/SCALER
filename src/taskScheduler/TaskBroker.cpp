@@ -42,19 +42,43 @@ std::vector<uint32_t> TaskBroker::collectReadyTasks() {
 #include <random>
 
 void TaskBroker::prioritizeTasks(std::vector<uint32_t>& task_ids) {
+    if (task_ids.empty()) return;
+
+    static std::random_device rd;
+    static std::mt19937 g(rd());
+
     if (random_mode) {
-        static std::random_device rd;
-        static std::mt19937 g(rd());
         std::shuffle(task_ids.begin(), task_ids.end(), g);
         return;
     }
 
-    std::sort(task_ids.begin(), task_ids.end(), [&](uint32_t a, uint32_t b) {
+    // Separate tasks into those with retries and fresh ones
+    std::vector<uint32_t> retried;
+    std::vector<uint32_t> fresh;
+
+    for (uint32_t tid : task_ids) {
+        if (tasks[tid]->retry_count > 0) {
+            retried.push_back(tid);
+        } else {
+            fresh.push_back(tid);
+        }
+    }
+
+    // 1. Sort retried tasks by retry count (highest first)
+    std::sort(retried.begin(), retried.end(), [&](uint32_t a, uint32_t b) {
         if (tasks[a]->retry_count != tasks[b]->retry_count) {
             return tasks[a]->retry_count > tasks[b]->retry_count;
         }
-        return a < b; // Neutral tie-breaker (ID-based FIFO)
+        return a < b; // Tie-breaker
     });
+
+    // 2. Randomize fresh tasks
+    std::shuffle(fresh.begin(), fresh.end(), g);
+
+    // Reconstruct the task_ids vector
+    task_ids.clear();
+    task_ids.insert(task_ids.end(), retried.begin(), retried.end());
+    task_ids.insert(task_ids.end(), fresh.begin(), fresh.end());
 }
 
 std::vector<uint32_t> TaskBroker::binPackTasks(const std::vector<uint32_t>& candidates, int gpu_id, size_t max_vram) {
