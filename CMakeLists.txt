@@ -64,8 +64,9 @@ list(TRANSFORM DISKANN_MEMORY_INDEX  PREPEND ${DISKANN_APP_PATH}/)
 
 
 
-set(DISK_PARTITION_SOURCES 
+set(DISK_PARTITION_SOURCES
     partition/partition.cpp partition/disk_partition.cpp partition/kmeans.cpp partition/kmeans.cu
+    partition/kmeans_cpu.cpp
     utils/indexIO.cpp utils/datasetIO.cpp utils/distance.cpp)
 list(TRANSFORM DISK_PARTITION_SOURCES  PREPEND ${SCALEGANN_SRC_PATH}/)
 set(DISK_PARTITION_APP
@@ -82,6 +83,9 @@ list(TRANSFORM DISK_MERGE_SOURCES  PREPEND ${SCALEGANN_SRC_PATH}/)
 set(DISK_MERGE_APP
     executeDiskMerge.cpp)
 list(TRANSFORM DISK_MERGE_APP  PREPEND ${SCALEGANN_APP_PATH}/)
+set(DISK_PIPELINED_MERGE_APP
+    executeDiskPipelinedMerge.cpp)
+list(TRANSFORM DISK_PIPELINED_MERGE_APP  PREPEND ${SCALEGANN_APP_PATH}/)
 
 # set(MERGE_SOURCES 
 #     merge/merge.cpp merge/merge.cu
@@ -139,6 +143,7 @@ target_link_libraries(scheduler PRIVATE ${COMMON_LIBS})
 # ... existing code ...
 
 add_executable(executeDiskMerge ${DISK_MERGE_APP} ${DISK_MERGE_SOURCES} ${DISKANN_SOURCES})
+add_executable(executeDiskPipelinedMerge ${DISK_PIPELINED_MERGE_APP} ${DISK_MERGE_SOURCES} ${DISKANN_SOURCES})
 # add_executable(executeMerge ${MERGE_SOURCES} ${DISKANN_SOURCES})
 
 target_link_libraries(executeDiskMerge PRIVATE scheduler)
@@ -168,6 +173,113 @@ set(ALL_TARGETS
     testTaskBroker testSimulation
 )
 
-foreach(target IN LISTS ALL_TARGETS)
-    target_link_libraries(${target} PRIVATE ${COMMON_LIBS})
-endforeach()
+target_link_libraries(executeDiskPartition
+    PRIVATE
+    cudart
+    dl
+    benchmark
+    pthread
+    fmt
+    mkl_rt
+    m
+    Boost::program_options
+)
+target_link_libraries(executeDiskDirectPartition
+    PRIVATE
+    cudart
+    dl
+    benchmark
+    pthread
+    fmt
+    mkl_rt
+    m
+    Boost::program_options
+)
+target_link_libraries(executeDiskMerge
+    PRIVATE
+    cudart
+    dl
+    benchmark
+    pthread
+    fmt
+    mkl_rt
+    m
+    Boost::program_options
+)
+target_link_libraries(executeDiskPipelinedMerge
+    PRIVATE
+    cudart
+    dl
+    benchmark
+    pthread
+    fmt
+    mkl_rt
+    m
+    Boost::program_options
+)
+# target_link_libraries(executeMerge
+#     PRIVATE
+#     cudart
+#     dl
+#     benchmark
+#     pthread
+#     fmt
+#     mkl_rt
+#     m
+# )
+target_link_libraries(searchScaleGANN
+    PRIVATE
+    cudart
+    dl
+    benchmark
+    pthread
+    fmt
+    mkl_rt
+    m
+    Boost::program_options
+)
+target_link_libraries(searchCAGRA
+    PRIVATE
+    cudart
+    dl
+    benchmark
+    pthread
+    fmt
+    mkl_rt
+    m
+    Boost::program_options
+)
+target_link_libraries(searchGGNN
+    PRIVATE
+    cudart
+    dl
+    benchmark
+    pthread
+    fmt
+    mkl_rt
+    m
+    Boost::program_options
+)
+target_link_libraries(searchDiskANN
+    PRIVATE
+    cudart
+    dl
+    benchmark
+    pthread
+    fmt
+    mkl_rt
+    m
+    Boost::program_options
+)
+# set(COMMON_LIBS
+#     cudart
+#     dl
+#     benchmark
+#     pthread
+#     fmt
+#     mkl_rt
+#     m
+# )
+# foreach(target IN LISTS executeDiskPartition executeMerge searchScaleGANN)
+#     target_link_libraries(${target} PRIVATE ${COMMON_LIBS})
+# endforeach()

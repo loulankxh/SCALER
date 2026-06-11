@@ -1,11 +1,11 @@
 #!/bin/bash
 DataPath="/home/lanlu/scaleGANN/dataset/"
-DATASET="sift1B"
-SHARD_FOLDER="/NaiveCAGRA"
-DIM=128
-SHARD_NUM=100
-QueryFile="/home/lanlu/scaleGANN/dataset/sift1B/query.public.10K.u8bin"
-GTFile="/home/lanlu/scaleGANN/dataset/sift1B/groundtruth.neighbors.ibin"
+DATASET="msTuring100M"
+SHARD_FOLDER="/ScaleGANN"
+DIM=100
+SHARD_NUM=20
+QueryFile="/home/lanlu/scaleGANN/dataset/msTuring100M/query.public.10K.fbin"
+GTFile="/home/lanlu/scaleGANN/dataset/msTuring100M/groundtruth.neighbors.ibin"
 
 BUILD_DEG=(64)
 BUILD_INTERMEDIATE_DEG=(128)
@@ -25,7 +25,7 @@ for ((i=0; i<SHARD_NUM; i++)); do
 {
     "dataset": {
         "name": "$DATASET",
-        "base_file": "$partition_path/data.u8bin",
+        "base_file": "$partition_path/data.fbin",
         "dims": $DIM,
         "query_file": "$QueryFile",
         "groundtruth_neighbors_file": "$GTFile",

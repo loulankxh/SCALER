@@ -13,7 +13,12 @@
 
 namespace po = boost::program_options;
 
-#define MAX_ITERATION 15
+// [SAMPLE-FIX, scheme B] 15 → 10, matching DiskANN's partition_with_ram_budget
+//   ([DiskANN/src/partition.cpp:529]). DiskANN's PQ training still uses 15
+//   because it needs precise centroid placement; partition kmeans only needs
+//   reasonable cluster boundaries, for which 10 iters + 1e-5 early-stop is
+//   sufficient.
+#define MAX_ITERATION 10
 #define SAMPLING_RATE 0.05
 
 
@@ -108,7 +113,15 @@ int main(int argc, char **argv) {
     printf("Expected build degree is %d\n", build_deg);
     printf("Maximum inter-build degree is %d\n", inter_build_deg);
 
-    partitionDisk_kmeans(data_path, base_folder,   
+    // Pre-processing: drop any stale partition output from a previous run BEFORE
+    // starting the timer. Without this, opening multi-GB files with ios::trunc
+    // (inside the timed region) causes synchronous block-release + journal
+    // commits, AND old cached pages compete with new I/O for OS page cache.
+    // This call uses unlink (async block release), so its cost stays small and
+    // does not pollute the partition duration we report.
+    cleanup_partition_dir(base_folder);
+
+    partitionDisk_kmeans(data_path, base_folder,
                         memory_budget, build_deg, inter_build_deg, gpu_threads, max_duplication, epsilon,
                         minimum_partition_num, max_iteration, sampling_rate);
     return 0;
