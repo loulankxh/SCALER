@@ -15,4 +15,6 @@ the instance service is terminated, it is marked as inactive and removed from th
 
 The scheduler then uses the shard information and retry-count and assigns the task to one of the available GPU's from the pool. In case the GPU is disconnected mid-task, the retry-count for the task is incremented and the task is pushed back into the task queue for scheduler to re-prioritize and assign.
 
-Figure 3 illustrates 
+As we see in Figure 4. Our policy performs significantly better than the random policy. We see a performance improvement of about 50% in average task completion duration between our policy and random scheduling.
+
+We decided to run our policy 100 times to remove the possibility of our policy "getting lucky".And, this is corraborated in Figure 5 where we decided to draw a comparative analysis betweeen our policy, ideal policy and random scheduling via line charts. On X-axis we show the number of points processed and Y-axis shows the time taken for a task from start time i.e when it entered the queue to final finish time when the task finally finished inclusive of the wait time. We see our policy finish close to ideal policy where we finish 13M points around 
