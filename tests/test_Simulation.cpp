@@ -26,62 +26,67 @@ std::vector<ShardInfo> loadShards(const std::string& path) {
     return shards;
 }
 
-void run_policy_sim(const std::vector<ShardInfo>& shards, int iteration) {
+void run_policy_sim(const std::vector<ShardInfo>& shards, int iteration, const std::string& trace_file) {
     TaskBroker broker;
     for (const auto& s : shards) {
         broker.addTask(s.id, s.n, 128, 32);
     }
-    std::string filename = "tests/policy_runs/sim_events_" + std::to_string(iteration) + ".csv";
-    TraceSimulator sim(broker, "tests/p3-trace.csv", "tests/build_time.csv", 4, 2000, 0.1, SimulationMode::POLICY, filename);
+    std::string filename = "SchedulerArtifacts/results/policy/sim_events_" + std::to_string(iteration) + ".csv";
+    TraceSimulator sim(broker, trace_file, "SchedulerArtifacts/build_time.csv", 4, 2000, 0.1, SimulationMode::POLICY, filename);
     sim.run();
 }
 
-void run_random_sim(const std::vector<ShardInfo>& shards, int iteration) {
+void run_random_sim(const std::vector<ShardInfo>& shards, int iteration, const std::string& trace_file) {
     TaskBroker broker;
     broker.setRandomMode(true); 
     for (const auto& s : shards) {
         broker.addTask(s.id, s.n, 128, 32);
     }
-    std::string filename = "tests/random_runs/sim_events_" + std::to_string(iteration) + ".csv";
-    TraceSimulator sim(broker, "tests/p3-trace.csv", "tests/build_time.csv", 4, 2000, 0.1, SimulationMode::RANDOM, filename);
+    std::string filename = "SchedulerArtifacts/results/random/sim_events_" + std::to_string(iteration) + ".csv";
+    TraceSimulator sim(broker, trace_file, "SchedulerArtifacts/build_time.csv", 4, 2000, 0.1, SimulationMode::RANDOM, filename);
     sim.run();
 }
 
-void run_no_interruption_sim(const std::vector<ShardInfo>& shards) {
+void run_no_interruption_sim(const std::vector<ShardInfo>& shards, const std::string& trace_file) {
     TaskBroker broker;
     for (const auto& s : shards) {
         broker.addTask(s.id, s.n, 128, 32);
     }
-    TraceSimulator sim(broker, "tests/p3-trace.csv", "tests/build_time.csv", 4, 0, 0.1, SimulationMode::NO_INTERRUPTION, "tests/sim_events_nopreempt.csv");
+    TraceSimulator sim(broker, trace_file, "SchedulerArtifacts/build_time.csv", 4, 0, 0.1, SimulationMode::NO_INTERRUPTION, "SchedulerArtifacts/results/sim_events_nopreempt.csv");
     sim.run();
 }
 
 int main(int argc, char* argv[]) {
-    int num_runs = 5; // Default
+    int num_runs = 5; 
+    std::string trace_file = "SchedulerArtifacts/GPU_Traces/p3-trace.csv"; 
+
     if (argc > 1) {
         num_runs = std::stoi(argv[1]);
     }
+    if (argc > 2) {
+        trace_file = argv[2];
+    }
 
-    auto shards = loadShards("tests/shard_info.csv");
+    auto shards = loadShards("SchedulerArtifacts/shard_info.csv");
     if (shards.empty()) {
         std::cerr << "Error: No shards loaded." << std::endl;
         return 1;
     }
 
-    std::cout << "=== Running " << num_runs << " Policy Simulations (Hybrid) ===" << std::endl;
+    std::cout << "=== Running " << num_runs << " Policy Simulations (Hybrid) using trace: " << trace_file << " ===" << std::endl;
     for(int i=0; i < num_runs; ++i) {
         if (i % 10 == 0) std::cout << "Policy Iteration " << i << "..." << std::endl;
-        run_policy_sim(shards, i);
+        run_policy_sim(shards, i, trace_file);
     }
 
-    std::cout << "\n=== Running " << num_runs << " Randomized Baseline Simulations ===" << std::endl;
+    std::cout << "\n=== Running " << num_runs << " Randomized Baseline Simulations using trace: " << trace_file << " ===" << std::endl;
     for (int i = 0; i < num_runs; ++i) {
         if (i % 10 == 0) std::cout << "Random Iteration " << i << "..." << std::endl;
-        run_random_sim(shards, i);
+        run_random_sim(shards, i, trace_file);
     }
 
-    std::cout << "\n=== Running No-Interruption Simulation ===" << std::endl;
-    run_no_interruption_sim(shards);
+    std::cout << "\n=== Running No-Interruption Simulation using trace: " << trace_file << " ===" << std::endl;
+    run_no_interruption_sim(shards, trace_file);
 
     return 0;
 }

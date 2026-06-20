@@ -30,7 +30,7 @@ class TraceSimulator {
 public:
     TraceSimulator(TaskBroker& broker, const std::string& trace_file, const std::string& build_time_file = "", 
                    int node_filter_step = 1, long startup_delay_ms = 0, double time_scale = 1.0, 
-                   SimulationMode mode = SimulationMode::POLICY, const std::string& log_path = "tests/sim_events.csv") 
+                   SimulationMode mode = SimulationMode::POLICY, const std::string& log_path = "SchedulerArtifacts/results/sim_events.csv") 
         : broker(broker), current_time(0), event_idx(0), node_filter_step(node_filter_step), 
           startup_delay_ms(startup_delay_ms), time_scale(time_scale), mode(mode) {
         
@@ -98,6 +98,7 @@ private:
         if (!file.is_open()) return;
         std::set<int> unique_nodes;
         std::string line;
+        std::getline(file, line); // Skip header
         while (std::getline(file, line)) {
             if (line.empty()) continue;
             std::stringstream ss(line);
@@ -119,6 +120,7 @@ private:
         std::ifstream file(file_path);
         if (!file.is_open()) return;
         std::string line;
+        std::getline(file, line); // Skip header
         while (std::getline(file, line)) {
             if (line.empty()) continue;
             if (line.back() == '\r') line.pop_back();

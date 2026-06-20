@@ -151,9 +151,6 @@ add_executable(searchCAGRA ${SEARCH_CAGRA_APP} ${SEARCH_SOURCES})
 add_executable(searchGGNN ${SEARCH_GGNN_APP} ${SEARCH_SOURCES})
 add_executable(searchDiskANN ${SEARCH_DISKANN_APP} ${SEARCH_SOURCES})
 
-add_executable(testTaskBroker tests/test_TaskBroker.cpp)
-target_link_libraries(testTaskBroker PRIVATE scheduler)
-
 add_executable(testSimulation tests/test_Simulation.cpp)
 target_link_libraries(testSimulation PRIVATE scheduler)
 
@@ -169,7 +166,7 @@ set(ALL_TARGETS
     diskannPartition diskannBuild diskannMerge diskannComputeGT diskannMemoryIndex
     executeDiskPartition executeDiskDirectPartition executeDiskMerge executeMemoryMerge
     searchScaleGANN searchCAGRA searchGGNN searchDiskANN
-    testTaskBroker testSimulation
+    testSimulation
 )
 
 foreach(target IN LISTS ALL_TARGETS)
