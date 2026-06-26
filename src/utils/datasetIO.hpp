@@ -1,7 +1,21 @@
 #include <vector>
 #include <string>
+#include <cstddef>
 
 uint32_t suffixToType(std::string file);
+
+// Preprocessing helper: deletes leftover partition output from a previous run.
+//   Scans base_folder and removes any "partition*" subdirectory and the
+//   "centroids.bin" file. Should be called BEFORE the official timer starts —
+//   self-prints its own duration but does not contribute to partition timing.
+//   Returns the number of filesystem entries removed.
+//
+//   Why this matters: opening a multi-GB file with std::ios::trunc forces a
+//   synchronous block-release + journal commit, and old cached pages compete
+//   with new I/O for OS page cache. Unlinking via std::filesystem::remove_all
+//   uses unlink() which is essentially async (kernel releases blocks lazily),
+//   so cleanup costs are much smaller and don't pollute the timed run.
+std::size_t cleanup_partition_dir(const std::string& base_folder);
 
 template <typename T>
 std::string typeToSuffix();

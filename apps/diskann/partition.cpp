@@ -17,7 +17,9 @@
 
 namespace po = boost::program_options;
 
-#define MAX_ITERATION 15
+// 15 → 10, matching DiskANN's own partition_with_ram_budget
+// ([DiskANN/src/partition.cpp:529]).
+#define MAX_ITERATION 10
 #define SAMPLING_RATE 0.05
 
 
@@ -98,6 +100,10 @@ int main(int argc, char **argv) {
     mkl_set_num_threads(num_threads);
     printf("Using %d threads\n", num_threads);
     printf("Build degree is %d\n", build_deg);
+
+    // Pre-processing: drop any stale partition output from a previous run BEFORE
+    // starting the timer. See apps/executeDiskPartition.cpp for the full rationale.
+    cleanup_partition_dir(base_folder);
 
     partition(data_path, base_folder, memory_budget, build_deg, max_duplication, max_iteration, sampling_rate);
     return 0;

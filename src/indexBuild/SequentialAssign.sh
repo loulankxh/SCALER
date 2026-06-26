@@ -10,6 +10,10 @@ N=100
 RAFT_CAGRA="/home/lanlu/miniconda3/envs/rapids_raft/bin/ann/RAFT_CAGRA_ANN_BENCH"
 LOG_FILE=${DatasetPath}/${SHARD_FOLDER}/time.txt
 
+mkdir -p "$(dirname "$LOG_FILE")"
+: > "$LOG_FILE"
+echo -e "shard_id\tgpu\tbuild_time_s" >> "$LOG_FILE"
+
 start_time=$(date +%s)
 
 for ((i=0; i<N; i++)); do
@@ -27,12 +31,13 @@ for ((i=0; i<N; i++)); do
         --benchmark_out="$OUTPUT_FILE" \
         --raft_log_level=3 \
         "$TASK_FILE"
-    
-    
+
+
     task_end_time=$(date +%s)
     task_duration=$((task_end_time - task_start_time))
 
     echo "Task $i (GPU $GPU_ID) finished in ${task_duration} seconds" | tee -a "$LOG_FILE"
+    printf "%d\t%d\t%d\n" "$i" "$GPU_ID" "$task_duration" >> "$LOG_FILE"
 done
 
 wait

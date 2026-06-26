@@ -78,6 +78,10 @@ int main(int argc, char **argv) {
     mkl_set_num_threads(num_threads);
     printf("Using %d threads\n", num_threads);
 
+    // Pre-processing: drop any stale partition output from a previous run BEFORE
+    // starting the timer. See executeDiskPartition.cpp for the full rationale.
+    cleanup_partition_dir(base_folder);
+
     partitionDisk_direct(data_path, base_folder, shard_size, dataset_size);
     return 0;
 }

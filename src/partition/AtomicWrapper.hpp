@@ -34,11 +34,19 @@ struct AtomicWrapper {
         return _a.load();
     }
 
+    T load_relaxed() {
+        return _a.load(std::memory_order_relaxed);
+    }
+
     void store(const std::atomic<T> &a) {
         _a.store(a);
     }
 
     T operator++(int) {
         return _a.fetch_add(1);
+    }
+
+    T fetch_add_relaxed(T v) {
+        return _a.fetch_add(v, std::memory_order_relaxed);
     }
 };

@@ -7,8 +7,48 @@
 #include <fstream>
 #include <omp.h>
 #include <filesystem>
+#include <chrono>
 
 #include "datasetIO.hpp"
+
+
+std::size_t cleanup_partition_dir(const std::string& base_folder) {
+    namespace fs = std::filesystem;
+    // Nothing to clean if the folder doesn't exist yet (first run).
+    if (!fs::exists(base_folder) || !fs::is_directory(base_folder)) {
+        return 0;
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    std::size_t removed = 0;
+    try {
+        for (const auto& entry : fs::directory_iterator(base_folder)) {
+            const auto& path = entry.path();
+            const std::string name = path.filename().string();
+            // Match "partition*" subdirs (partition0, partition1, ...) and the
+            // centroids.bin file written by scaleGANN_partitions_with_ram_budget.
+            // Anything else in base_folder is left untouched (user's own files).
+            bool is_partition_dir = entry.is_directory() && name.rfind("partition", 0) == 0;
+            bool is_centroids = !entry.is_directory() && name == "centroids.bin";
+            if (is_partition_dir || is_centroids) {
+                removed += fs::remove_all(path);
+            }
+        }
+    } catch (const fs::filesystem_error& e) {
+        std::cerr << "[cleanup] warning while removing old partition data: "
+                  << e.what() << std::endl;
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    if (removed > 0) {
+        std::cout << "[cleanup] removed " << removed
+                  << " old partition entries from " << base_folder
+                  << " in " << ms
+                  << " ms (preprocessing, NOT included in partition timing)"
+                  << std::endl;
+    }
+    return removed;
+}
 
 
 uint32_t suffixToType(std::string file){

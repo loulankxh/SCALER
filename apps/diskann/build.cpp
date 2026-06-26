@@ -126,6 +126,8 @@ int main(int argc, char **argv){
                                                               .with_num_threads(num_threads)
                                                               .build();
 
+    std::vector<long long> shard_durations_ms(partition_num, 0);
+
     for (uint32_t shard_id = 0; shard_id < partition_num; shard_id++){
         std::string shard_data_path = base_folder + "/partition" + std::to_string(shard_id) + "/data" + data_postfix;
         std::string shard_index_folder = base_folder + "/partition" + std::to_string(shard_id) + "/index/";
@@ -143,6 +145,8 @@ int main(int argc, char **argv){
         reader.read((char *)&shard_base_pts, sizeof(uint32_t));
         reader.read((char *)&shard_base_dim, sizeof(uint32_t));
 
+        auto shardStart = std::chrono::high_resolution_clock::now();
+
         if (data_type == "float") {
             build_index<float>(metric, shard_base_dim, shard_base_pts, std::make_shared<diskann::IndexWriteParameters>(low_degree_params),
                                 shard_data_path, shard_index_path);
@@ -155,6 +159,11 @@ int main(int argc, char **argv){
         //     build_index<uint32_t>(metric, shard_base_dim, shard_base_pts, std::make_shared<diskann::IndexWriteParameters>(low_degree_params),
         //                         shard_data_path, shard_index_path);
         // }
+
+        auto shardEnd = std::chrono::high_resolution_clock::now();
+        auto shardDuration = std::chrono::duration_cast<std::chrono::milliseconds>(shardEnd - shardStart);
+        shard_durations_ms[shard_id] = shardDuration.count();
+        printf("Shard %u build duration: %lld milliseconds\n", shard_id, shardDuration.count());
     }
 
     auto endTime = std::chrono::high_resolution_clock::now();
@@ -164,5 +173,24 @@ int main(int argc, char **argv){
 
     size_t memory_usage=getProcessPeakRSS();
     printf("Maximum memory usage is %zu\n", memory_usage);
+
+    std::string time_log_path = base_folder + "/build_time.txt";
+    std::ofstream time_log(time_log_path);
+    if (time_log.is_open()) {
+        time_log << "shard_id\tbuild_time_ms\n";
+        long long sum_shard_ms = 0;
+        for (uint32_t shard_id = 0; shard_id < partition_num; shard_id++) {
+            time_log << shard_id << "\t" << shard_durations_ms[shard_id] << "\n";
+            sum_shard_ms += shard_durations_ms[shard_id];
+        }
+        time_log << "sum_of_shards_ms\t" << sum_shard_ms << " milliseconds\n";
+        time_log << "\n";
+        time_log << "DiskANN build duration: " << overallDuration.count() << " milliseconds\n";
+        time_log << "Maximum memory usage is " << memory_usage << "\n";
+        time_log.close();
+        std::cout << "Wrote build timing stats to " << time_log_path << std::endl;
+    } else {
+        std::cerr << "Failed to open build timing log: " << time_log_path << std::endl;
+    }
 }
 

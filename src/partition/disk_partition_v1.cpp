@@ -8,9 +8,7 @@
 #include <omp.h>
 #include <vector>
 #include <cfloat>
-#include <algorithm>
-#include <cstring>
-#include <chrono>   // [B1 DIAG] per-phase timing
+#include <chrono>   // [PROFILE] per-phase wall-clock timing
 
 #include "../../DiskANN/include/partition.h"
 #include "../../DiskANN/include/utils.h"
@@ -18,38 +16,10 @@
 #include "../../DiskANN/include/index.h"
 #include "partition.h"
 #include "AtomicWrapper.hpp"
-#include "kmeans_cpu.h"   // optimized CPU run_lloyds (fixes 1+2+3 vs DiskANN's)
 
-// [SAMPLE-FIX, scheme B] Sample-size policy for k-means training in
-//   `scaleGANN_partitions_with_ram_budget`.
-//
-//   Was: MAX_SAMPLE = 8388608 (1 << 23). For a 100M dataset with K=10 clusters,
-//   this produced ~5M training points and run_lloyds took ~81 s — wildly
-//   excessive for K=10. The original choice mis-used DiskANN's k-means++
-//   ALGORITHM HARD LIMIT (8388608) as a target — those are different things.
-//
-//   Now (scheme B): adaptive
-//     target_sample = clamp(num_parts * SAMPLE_PER_CLUSTER,
-//                           SAMPLE_BASE, KMEANSPP_HARD_LIMIT)
-//
-//   Constants:
-//     SAMPLE_BASE = 256000          mirrors DiskANN's MAX_PQ_TRAINING_SET_SIZE
-//                                   (used for DiskANN's own k-means training).
-//     SAMPLE_PER_CLUSTER = 1000     keep ~1000 samples / cluster minimum.
-//     KMEANSPP_HARD_LIMIT = 1<<23   above this, DiskANN's kmeanspp falls back
-//                                   to random pivot selection — quality drops,
-//                                   so we cap to stay below it.
-//
-//   Examples (K = num_parts):
-//     K=10    → 256K samples       (matches DiskANN PQ training)
-//     K=1000  → 1M samples
-//     K=8388  → ~8.4M (cap)
-//
-//   The wrapper still respects a user --sampling_rate if it is SMALLER than
-//   the cap (cap is a ceiling only).
-#define SAMPLE_BASE         256000      // floor cap, == DiskANN's MAX_PQ_TRAINING_SET_SIZE
-#define SAMPLE_PER_CLUSTER  1000        // samples per k-means cluster
-#define KMEANSPP_HARD_LIMIT 8388608     // (1<<23) — DiskANN kmeanspp algorithm cap
+// Lan: todo: add a sample maximum upper bound
+#define MAX_SAMPLE 8388608 // 1 << 23
+#define MAX_SAMPLE_FOR_KMEANS_TRAINING 256000 // 1 << 23
 #define BLOCK_SIZE 5000000
 
 
@@ -251,10 +221,10 @@ void scaleGANN_shard_data_into_clusters_with_ram_budget_rankSequential(const std
     // uint32_t const_one = 1;
 
     for (size_t i = 0; i < num_centers; i++)
-    {
+    {   
         std::string partition_dir = prefix_path + "/partition" + std::to_string(i);
         ensure_directory_exists(partition_dir);
-
+        
         uint32_t dotPos = data_file.find_last_of('.');
         if (dotPos == std::string::npos) {
             throw std::invalid_argument("File does not have a valid suffix.");
@@ -279,13 +249,10 @@ void scaleGANN_shard_data_into_clusters_with_ram_budget_rankSequential(const std
     size_t num_blocks = DIV_ROUND_UP(num_points, block_size);
 
     // To parallel the node assignment and reduction, extra data structures are used for maintain the results for final write (which can not be parallelled)
+    // std::unique_ptr<float[]> distance_matrix = std::make_unique<float[]>(num_centers, );
     float *distance_matrix = new float[num_centers * block_size]; // row: num points, col: num centers
-    // [B1] REMOVED: shard_to_ids (num_centers * block_size * 4B shared scratch).
-    //               Replaced by per-thread local_buf below — eliminates the
-    //               cache-line ping-pong on shared array writes during round 1/2.
-    // [B1] REMOVED: shard_counts_until_this_block (was used to compute per-block
-    //               relative index from global atomic counter; no longer needed
-    //               since per-thread buffer length = per-block count directly).
+    std::vector<std::unique_ptr<uint32_t[]>> shard_to_ids(num_centers);
+    std::unique_ptr<uint32_t[]> shard_counts_until_this_block = std::make_unique<uint32_t[]>(num_centers);
     std::unique_ptr<AtomicWrapper<uint32_t>[]> shard_counts_first_round = std::make_unique<AtomicWrapper<uint32_t>[]>(num_centers);
     std::unique_ptr<uint32_t[]> shard_counts_first_round_until_this_block = std::make_unique<uint32_t[]>(num_centers);
     std::unique_ptr<AtomicWrapper<uint32_t>[]> shard_counts_second_round = std::make_unique<AtomicWrapper<uint32_t>[]>(num_centers);
@@ -296,6 +263,9 @@ void scaleGANN_shard_data_into_clusters_with_ram_budget_rankSequential(const std
     std::unique_ptr<uint32_t[]> first_round_assignment = std::make_unique<uint32_t[]>(block_size);
     std::unique_ptr<float[]> shard_radius = std::make_unique<float[]>(num_centers);
     for (size_t i = 0; i < num_centers; i++) {
+        shard_to_ids[i] = std::make_unique<uint32_t[]>(block_size);
+        shard_counts_until_this_block[i] = 0;
+
         shard_counts_first_round[i].store(0);
         shard_counts_first_round_until_this_block[i] = 0;
         shard_counts_second_round[i].store(0);
@@ -307,118 +277,17 @@ void scaleGANN_shard_data_into_clusters_with_ram_budget_rankSequential(const std
         first_round_assignment[i] = num_centers; // initial: unassiged value
     }
 
-    // =====================================================================
-    // [B1] Per-thread state for "per-thread buffer + dynamic K flush".
-    //
-    // Motivation:
-    //   Original code did `shard_counts[s].fetch_add(1)` + write to shared
-    //   `shard_to_ids[s][idx]` for every assigned point — both cause heavy
-    //   cache-line ping-pong between cores. B1 moves all hot-loop writes
-    //   to per-thread buffers; the global atomic counter is touched only
-    //   every FLUSH_K assignments (plus a residual flush after each round).
-    //
-    // Dynamic K formula:
-    //   worst-case cap overshoot = max_threads * FLUSH_K
-    //   target ≈ 1% of the round's cap → K = cap * 0.01 / threads
-    //   clamped to [2, 256]: floor=2 keeps benefit when caps are very small,
-    //   ceiling=256 because flush amortization saturates beyond that.
-    // =====================================================================
-    const int max_threads = omp_get_max_threads();
-    const uint32_t FLUSH_K_R1 = std::clamp<uint32_t>(
-        (uint32_t)(size_limit_first_round * 0.01) / (uint32_t)max_threads,
-        2u, 256u);
-    const uint32_t FLUSH_K_R2 = std::clamp<uint32_t>(
-        (uint32_t)(size_lower_bound_second_round * 0.01) / (uint32_t)max_threads,
-        2u, 256u);
-    diskann::cout << "[B1] Flush intervals: R1=" << FLUSH_K_R1
-                  << ", R2=" << FLUSH_K_R2
-                  << " (size_limit=" << size_limit
-                  << ", first_round_cap=" << size_limit_first_round
-                  << ", second_round_lower=" << size_lower_bound_second_round
-                  << ", threads=" << max_threads << ")" << std::endl;
-
-    // local_buf[t][s]: per-thread per-shard list of assigned point ids
-    // (both rounds push here). No atomic, no shared write — each thread only
-    // touches its own t row, eliminating cache-line contention entirely.
-    std::vector<std::vector<std::vector<uint32_t>>> local_buf(
-        max_threads, std::vector<std::vector<uint32_t>>(num_centers));
-    // [B1 FIX] Reserve formula: previous clamp(avg, 16, 512) caused ~5
-    //          reallocations per bucket per block under heavy allocator
-    //          contention (80 threads vs glibc ptmalloc arenas) — ~80 sec
-    //          regression on the user's SIFT100M / T=80 / S=10 config.
-    //   New formula: reserve = max(64, avg × 2). 2× headroom covers typical
-    //   k-means skew → zero realloc for normal buckets, at most 1 realloc
-    //   for heavily skewed shards.
-    //   Total local_buf memory derived analytically:
-    //       T × S × (block_size × k_base / (T × S)) × 2 × 4
-    //     = block_size × k_base × 8 bytes      (T, S, dim, size_limit all cancel)
-    //   For BS=5M, k_base=8 → 320 MB. Grows proportionally with k_base and BS.
-    //   Soft cap at 2 GB to prevent runaway in pathological configs (k_base≥64
-    //   or BS>20M); under normal configs the cap never triggers.
-    size_t per_bucket_avg = (block_size * k_base) / ((size_t)max_threads * num_centers) + 1;
-    size_t per_bucket_reserve = std::max<size_t>((size_t)64, per_bucket_avg * 2);
-    {
-        const size_t SAFETY_MAX_RESERVE_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GB soft cap
-        size_t total_reserve_bytes = (size_t)max_threads * num_centers
-                                   * per_bucket_reserve * sizeof(uint32_t);
-        if (total_reserve_bytes > SAFETY_MAX_RESERVE_BYTES) {
-            per_bucket_reserve = SAFETY_MAX_RESERVE_BYTES /
-                                 ((size_t)max_threads * num_centers * sizeof(uint32_t));
-            if (per_bucket_reserve < 64) per_bucket_reserve = 64;
-        }
-    }
-    diskann::cout << "[B1] per_bucket_reserve=" << per_bucket_reserve
-                  << " (avg=" << per_bucket_avg
-                  << ", total_local_buf_MB="
-                  << ((size_t)max_threads * num_centers * per_bucket_reserve * sizeof(uint32_t) / (1024 * 1024))
-                  << ")" << std::endl;
-    for (int t = 0; t < max_threads; t++) {
-        for (size_t s = 0; s < num_centers; s++) {
-            local_buf[t][s].reserve(per_bucket_reserve);
-        }
-    }
-    // local_count_r1/r2[t][s]: unflushed count of assignments by thread t to
-    // shard s in the current round. Flushed to global atomic when it reaches
-    // FLUSH_K_R{1,2}, and a residual flush happens after each round ends.
-    std::vector<std::vector<uint32_t>> local_count_r1(max_threads, std::vector<uint32_t>(num_centers, 0));
-    std::vector<std::vector<uint32_t>> local_count_r2(max_threads, std::vector<uint32_t>(num_centers, 0));
-    // shard_radius_local[t][s]: per-thread per-shard max distance for the
-    // CURRENT block's round 1 (reset each block). Reduced into the
-    // cross-block-accumulating shard_radius[s] after round 1 ends. This
-    // fixes the prior data race on the non-atomic shard_radius update.
-    std::vector<std::vector<float>> shard_radius_local(max_threads, std::vector<float>(num_centers, 0.0f));
-    // [B1 FIX] sort_scratch is now PER-SHARD (not per-thread).
-    //   Rationale: the merge phase runs `parallel for` over shards, so at any
-    //   instant only one thread touches a given shard. Per-shard means:
-    //     (a) memory is bounded by S × max_shard_size (instead of T × max_shard_size),
-    //         saving up to (T-S)× memory when T >> S.
-    //     (b) we can pre-reserve exactly to the expected per-shard size,
-    //         eliminating the ~log2(T) reallocations that otherwise happen
-    //         when concat'ing T thread buffers into the scratch.
-    //   Pre-reserve size = expected per-shard total × 2 (skew headroom).
-    //   Total sort_scratch memory ≈ block_size × k_base × 8 bytes
-    //   (same order as local_buf). For BS=5M, k_base=8 → 320 MB.
-    std::vector<std::vector<uint32_t>> sort_scratch(num_centers);
-    size_t expected_per_shard = (block_size * k_base) / num_centers + 1;
-    size_t per_shard_scratch_reserve = expected_per_shard * 2;
-    for (size_t s = 0; s < num_centers; s++) {
-        sort_scratch[s].reserve(per_shard_scratch_reserve);
-    }
-    diskann::cout << "[B1] sort_scratch per-shard reserve=" << per_shard_scratch_reserve
-                  << " elements (total " << (num_centers * per_shard_scratch_reserve * sizeof(uint32_t) / (1024 * 1024))
-                  << " MB)" << std::endl;
-    // =====================================================================
-
-    // [B1 DIAG] Per-phase wall-clock accumulators (for diagnosing slowdown).
-    //   Each is summed across all blocks. Printed at function end.
-    double t_io_read = 0, t_convert = 0, t_dist = 0;
-    double t_reset = 0, t_round1 = 0, t_flush_r1 = 0, t_radius_reduce = 0;
-    double t_data_dist = 0, t_round2 = 0, t_flush_r2 = 0;
-    double t_merge_sort_write = 0, t_bookkeeping = 0;
+    // [PROFILE] Per-phase wall-clock accumulators (sum across all blocks).
+    //   Goal: identify which step actually dominates the partition runtime,
+    //   so we can tell whether further CPU optimization or I/O changes pay off.
     auto __now = []() {
         return std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now().time_since_epoch()).count();
     };
+    double t_io_read = 0, t_convert = 0, t_dist = 0;
+    double t_round1 = 0, t_data_dist = 0, t_round2 = 0;
+    double t_sort = 0, t_write = 0;
+    double t_setup_start = __now();  // (function entry to first block) – approximate setup time
 
     for (size_t block = 0; block < num_blocks; block++)
     {
@@ -426,123 +295,51 @@ void scaleGANN_shard_data_into_clusters_with_ram_budget_rankSequential(const std
         size_t end_id = (std::min)((block + 1) * block_size, num_points);
         size_t cur_blk_size = end_id - start_id;
 
-        double __t0 = __now();
+        // [PROFILE] I/O read
+        double __t = __now();
         base_reader.read((char *)block_data_T.get(), sizeof(T) * (cur_blk_size * dim));
-        double __t1 = __now(); t_io_read += __t1 - __t0;
+        double __t1 = __now(); t_io_read += __t1 - __t;
+        // [PROFILE] convert types T -> float
         diskann::convert_types<T, float>(block_data_T.get(), block_data_float.get(), cur_blk_size, dim);
         double __t2 = __now(); t_convert += __t2 - __t1;
 
-
+        // [PROFILE] distance compute (MKL-driven dense distance matrix)
         math_utils::compute_closest_centers_return_distance(block_data_float.get(), cur_blk_size, dim, pivots, num_centers, num_centers,
                                             block_closest_centers.get(), distance_matrix, NULL, NULL);
         double __t3 = __now(); t_dist += __t3 - __t2;
 
-        // [B1] Reset per-thread state at start of each block.
-        //      .clear() keeps the reserved capacity from outside the loop, so
-        //      no re-allocation happens here. shard_radius_local is reset to 0
-        //      so it only accumulates THIS block's max (it's reduced into the
-        //      cross-block-accumulating shard_radius after round 1).
-        double __t_reset_0 = __now();
-        #pragma omp parallel for schedule(static)
-        for (int t = 0; t < max_threads; t++) {
-            for (size_t s = 0; s < num_centers; s++) {
-                local_buf[t][s].clear();
-                local_count_r1[t][s] = 0;
-                local_count_r2[t][s] = 0;
-                shard_radius_local[t][s] = 0.0f;
-            }
-        }
-        t_reset += __now() - __t_reset_0;
-
+        // [PROFILE] Round 1 assignment (atomic-heavy hot loop)
+        double __t_r1 = __now();
         // Round 1 assignment: assign a point to its closest center
-        // [B1] Each thread accumulates to local_buf[tid][shard]/local_count_r1[tid][shard]
-        //      instead of writing to the shared shard_to_ids array via an atomic-
-        //      generated index. Global atomic counters are still consulted for the
-        //      cap check (relaxed load), and updated periodically every FLUSH_K_R1
-        //      assignments via fetch_add_relaxed(K), with a residual flush after
-        //      the loop. Worst-case cap overshoot bound: max_threads * FLUSH_K_R1.
-        double __t_r1_0 = __now();
         #pragma omp parallel for schedule(static)
         for (size_t p = 0; p < cur_blk_size; p++)
         {
-            int tid = omp_get_thread_num();
             for (size_t p1 = 0; p1 < num_centers; p1++)
             {
                 size_t shard_id = block_closest_centers[p * num_centers + p1];
-                // [B1] Cap check uses load_relaxed (cheap, Shared cache line) +
-                //      this thread's unflushed local_count. We see "globally committed"
-                //      + "own pending" — other threads' unflushed counts are not
-                //      visible, hence the bounded overshoot up to T * FLUSH_K_R1.
-                uint32_t r1_global   = shard_counts_first_round[shard_id].load_relaxed();
-                uint32_t total_global = shard_counts[shard_id].load_relaxed();
-                uint32_t mine = local_count_r1[tid][shard_id];
-                if ((r1_global + mine > size_limit_first_round) ||
-                    (total_global + mine > size_limit)) {
+                uint32_t current_r1_size = shard_counts_first_round[shard_id].load_relaxed(); // omp_get_num_procs: inaccuracy upper bound by concurrency after pragma & atomic
+                uint32_t curret_size = shard_counts[shard_id].load_relaxed();
+                if ((current_r1_size > size_limit_first_round) || (curret_size > size_limit)){
                     continue;
                 }
 
-                // [B1] Append to per-thread buffer (no atomic, no shared write).
-                local_buf[tid][shard_id].push_back((uint32_t)(start_id + p));
-                local_count_r1[tid][shard_id]++;
-                first_round_assignment[p] = (uint32_t)shard_id;
-
-                // [B1] shard_radius update uses thread-local array — no data race.
-                //      Will be reduced into global shard_radius after round 1 ends.
+                shard_counts_first_round[shard_id].fetch_add_relaxed(1);
+                first_round_assignment[p] = shard_id;
+                uint32_t original_point_map_id = (uint32_t)(start_id + p);
+                uint32_t current_id = shard_counts[shard_id].fetch_add_relaxed(1) - shard_counts_until_this_block[shard_id];
+                shard_to_ids[shard_id][current_id] = original_point_map_id;
                 float dist = distance_matrix[p * num_centers + (uint32_t)shard_id];
-                if (dist > shard_radius_local[tid][shard_id]) {
-                    shard_radius_local[tid][shard_id] = dist;
-                }
-
-                // [B1] Periodic flush so future cap checks stay within ~1% accuracy.
-                //      A single fetch_add_relaxed(K) is much cheaper than K
-                //      individual fetch_add_relaxed(1) calls under contention.
-                if (local_count_r1[tid][shard_id] >= FLUSH_K_R1) {
-                    shard_counts_first_round[shard_id].fetch_add_relaxed(local_count_r1[tid][shard_id]);
-                    shard_counts[shard_id].fetch_add_relaxed(local_count_r1[tid][shard_id]);
-                    local_count_r1[tid][shard_id] = 0;
+                if (dist > shard_radius[shard_id]){
+                    shard_radius[shard_id] = dist;
                 }
                 break;
             }
         }
+        t_round1 += __now() - __t_r1;
 
-        t_round1 += __now() - __t_r1_0;
-
-        // [B1] Residual flush for round 1: publish whatever each thread has left
-        //      in local_count_r1 to the global atomic counters. Parallelized over
-        //      threads — each thread row is independent, no contention.
-        double __t_fr1_0 = __now();
-        #pragma omp parallel for schedule(static)
-        for (int t = 0; t < max_threads; t++) {
-            for (size_t s = 0; s < num_centers; s++) {
-                if (local_count_r1[t][s] > 0) {
-                    shard_counts_first_round[s].fetch_add_relaxed(local_count_r1[t][s]);
-                    shard_counts[s].fetch_add_relaxed(local_count_r1[t][s]);
-                    local_count_r1[t][s] = 0;
-                }
-            }
-        }
-        t_flush_r1 += __now() - __t_fr1_0;
-
-        // [B1] Reduce per-thread shard_radius_local into the cross-block-accumulating
-        //      global shard_radius. CRITICAL: this is `max(global, local_max)`, NOT
-        //      `global = local_max` — shard_radius accumulates across ALL blocks
-        //      (initialized to 0 outside the block loop, never reset), so we must
-        //      merge this block's per-thread maxes into the running global max.
-        double __t_rr_0 = __now();
-        #pragma omp parallel for schedule(static)
-        for (size_t s = 0; s < num_centers; s++) {
-            float m = shard_radius[s];
-            for (int t = 0; t < max_threads; t++) {
-                if (shard_radius_local[t][s] > m) m = shard_radius_local[t][s];
-            }
-            shard_radius[s] = m;
-        }
-        t_radius_reduce += __now() - __t_rr_0;
-
+        // [PROFILE] Data distribution / size_limit_second_round update
+        double __t_dd = __now();
         // Update data distribution based on round 1, update round 2 size limit
-        // (Logic unchanged from original; reads global atomics that are now
-        // fully up-to-date thanks to the residual flush above.)
-        double __t_dd_0 = __now();
         #pragma omp parallel for schedule(static)
         for (size_t cluster = 0; cluster < num_centers; cluster++){
             data_distribution_first_round[cluster] = (data_distribution_first_round[cluster] * (block + 1) +
@@ -559,193 +356,131 @@ void scaleGANN_shard_data_into_clusters_with_ram_budget_rankSequential(const std
                 size_limit_second_round[cluster] = size_limit - shard_counts_first_round[cluster].load_relaxed();
             }
         }
-        t_data_dist += __now() - __t_dd_0;
+        t_data_dist += __now() - __t_dd;
 
+        // [PROFILE] Round 2 assignment (atomic-heavy hot loop)
+        double __t_r2 = __now();
         // Round 2 assignment: assign points to other centers for duplication, while under reduction rules
-        // [B1] Same per-thread-buffer + dynamic-K-flush pattern as round 1.
-        // [B1] schedule(dynamic, 256) replaces static — round 2 has heavy
-        //      data-dependent early exits (epsilon distance gating + break),
-        //      so points have very uneven work; dynamic scheduling rebalances
-        //      automatically without the overhead of per-iteration dispatch.
-        double __t_r2_0 = __now();
-        #pragma omp parallel for schedule(dynamic, 256)
+        #pragma omp parallel for schedule(static)
         for (size_t p = 0; p < cur_blk_size; p++)
         {
-            int tid = omp_get_thread_num();
             uint32_t assigned_count = 1;
-            uint32_t first_round_center = first_round_assignment[p];  // hoisted: invariant over p1
             for (size_t p1 = 0; p1 < num_centers; p1++)
             {
                 if (assigned_count >= k_base)
                     break;
+                uint32_t first_round_center = first_round_assignment[p];
                 size_t shard_id = block_closest_centers[p * num_centers + p1];
                 if (shard_id == first_round_center)
                     continue;
-
-                // [B1] Same cap-check pattern as round 1.
-                uint32_t r2_global    = shard_counts_second_round[shard_id].load_relaxed();
-                uint32_t total_global = shard_counts[shard_id].load_relaxed();
-                uint32_t mine = local_count_r2[tid][shard_id];
-                if ((r2_global + mine > size_limit_second_round[shard_id]) ||
-                    (total_global + mine > size_limit)) {
+                uint32_t current_r2_size = shard_counts_second_round[shard_id].load_relaxed(); // omp_get_num_procs: inaccuracy upper bound by concurrency after pragma & atomic
+                uint32_t curret_size = shard_counts[shard_id].load_relaxed();
+                if ((current_r2_size > size_limit_second_round[shard_id]) || (curret_size > size_limit)){
                     continue;
                 }
 
                 float dist = distance_matrix[p * num_centers + (uint32_t)shard_id];
                 if (dist < epsilon * distance_matrix[p * num_centers + first_round_center]){
                     if(dist < epsilon * (1 + (float)1 / (block + 1)) * shard_radius[shard_id]){
-                        // [B1] Per-thread buffer push instead of shared shard_to_ids write.
-                        local_buf[tid][shard_id].push_back((uint32_t)(start_id + p));
-                        local_count_r2[tid][shard_id]++;
+                        shard_counts_second_round[shard_id].fetch_add_relaxed(1);
+                        uint32_t original_point_map_id = (uint32_t)(start_id + p);
+                        uint32_t current_id = shard_counts[shard_id].fetch_add_relaxed(1) - shard_counts_until_this_block[shard_id];
+                        shard_to_ids[shard_id][current_id] = original_point_map_id;
                         assigned_count++;
-                        // [B1] Periodic flush.
-                        if (local_count_r2[tid][shard_id] >= FLUSH_K_R2) {
-                            shard_counts_second_round[shard_id].fetch_add_relaxed(local_count_r2[tid][shard_id]);
-                            shard_counts[shard_id].fetch_add_relaxed(local_count_r2[tid][shard_id]);
-                            local_count_r2[tid][shard_id] = 0;
-                        }
                     }
-                } else {
+                } else{
                     break;
                 }
             }
         }
+        t_round2 += __now() - __t_r2;
 
-        t_round2 += __now() - __t_r2_0;
-
-        // [B1] Residual flush for round 2.
-        double __t_fr2_0 = __now();
+        // [PROFILE] Sort phase (per shard: copy + std::sort + copy back)
+        double __t_sort = __now();
+        // Sorting for sequential disk layout
         #pragma omp parallel for schedule(static)
-        for (int t = 0; t < max_threads; t++) {
-            for (size_t s = 0; s < num_centers; s++) {
-                if (local_count_r2[t][s] > 0) {
-                    shard_counts_second_round[s].fetch_add_relaxed(local_count_r2[t][s]);
-                    shard_counts[s].fetch_add_relaxed(local_count_r2[t][s]);
-                    local_count_r2[t][s] = 0;
-                }
+        for (size_t shard_id = 0; shard_id < num_centers; shard_id ++){
+            auto& ptr = shard_to_ids[shard_id];
+            uint32_t len = (uint32_t)(shard_counts[shard_id].load_relaxed() - shard_counts_until_this_block[shard_id]);
+            std::vector<uint32_t> temp(len);
+            for (size_t i = 0; i < len; ++i) {
+                temp[i] = ptr[i];
+            }
+            std::sort(temp.begin(), temp.end());
+
+            for (size_t i = 0; i < len; ++i) {
+                ptr[i] = temp[i];
             }
         }
-        t_flush_r2 += __now() - __t_fr2_0;
+        t_sort += __now() - __t_sort;
 
-        // [B1] Merge per-thread buffers + sort + chunked packed write, all
-        //      parallelized over shards. Each shard handled by exactly one
-        //      thread (no concurrent writes to the same ofstream).
-        // [B1] schedule(dynamic, 1) because shard sizes are uneven (some
-        //      cluster centers are denser than others) — static would idle
-        //      threads that finished early.
-        double __t_msw_0 = __now();
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (size_t shard_id = 0; shard_id < num_centers; shard_id++) {
-            // [B1 FIX] sort_scratch indexed by shard_id (not tid) — each shard
-            //          is processed by exactly one thread at a time, so no
-            //          races, AND we benefit from the per-shard pre-reserve
-            //          done at setup (0 reallocations during insert).
-            auto& scratch = sort_scratch[shard_id];
-            scratch.clear();
-            // Concatenate all threads' per-shard buffers. Since scratch was
-            // pre-reserved to expected_per_shard × 2 at setup, this loop
-            // does zero reallocations even for moderately skewed shards.
-            for (int t = 0; t < max_threads; t++) {
-                auto& buf = local_buf[t][shard_id];
-                scratch.insert(scratch.end(), buf.begin(), buf.end());
-            }
-            std::sort(scratch.begin(), scratch.end());
-
-            // [B1 ROLLBACK] Per-point write (not chunked packed write).
-            //   Chunked write added an extra memcpy per data byte (memcpy into
-            //   scratch + ofstream::write copies into streambuf), which doubled
-            //   memory bandwidth for the write phase. For dim=128 float
-            //   (~512 B/point) the default streambuf already coalesces ~16
-            //   points per syscall, so the chunked-write win was negligible
-            //   while the memcpy cost was real.
-            for (size_t i = 0; i < scratch.size(); i++) {
-                uint32_t pid = scratch[i];
-                uint32_t p = pid - (uint32_t)start_id;
+        // [PROFILE] Write phase (per-point ofstream::write × 2, parallel by shard)
+        double __t_write = __now();
+        #pragma omp parallel for schedule(static)
+        for (size_t shard_id = 0; shard_id < num_centers; shard_id ++){
+            uint32_t shard_size_this_block = (uint32_t)(shard_counts[shard_id].load_relaxed() - shard_counts_until_this_block[shard_id]);
+            shard_counts_until_this_block[shard_id] = (uint32_t)(shard_counts[shard_id].load_relaxed());
+            shard_counts_first_round_until_this_block[shard_id] = (uint32_t)(shard_counts_first_round[shard_id].load_relaxed());
+            for (uint32_t i = 0; i < shard_size_this_block; i++){
+                uint32_t original_point_map_id = shard_to_ids[shard_id][i];
+                uint32_t p = original_point_map_id - (uint32_t)start_id;
                 shard_data_writer[shard_id].write((char *)(block_data_T.get() + p * dim), sizeof(T) * dim);
-                shard_idmap_writer[shard_id].write((char *)&pid, sizeof(uint32_t));
+                shard_idmap_writer[shard_id].write((char *)&original_point_map_id, sizeof(uint32_t));
             }
         }
-
-        t_merge_sort_write += __now() - __t_msw_0;
-
-        // [B1] Update bookkeeping for the data_distribution computation in the
-        //      NEXT block. (Only shard_counts_first_round_until_this_block is
-        //      still needed; shard_counts_until_this_block was removed since
-        //      per-block counts are now derived directly from local buffers.)
-        double __t_bk_0 = __now();
-        for (size_t s = 0; s < num_centers; s++) {
-            shard_counts_first_round_until_this_block[s] = (uint32_t)shard_counts_first_round[s].load_relaxed();
-        }
-        t_bookkeeping += __now() - __t_bk_0;
+        t_write += __now() - __t_write;
     }
+    double t_block_loop_end = __now();
 
-    // [B1 DIAG] Print per-phase timings (sum across all blocks).
-    diskann::cout << "[B1 DIAG] Phase timings (sum across " << num_blocks << " blocks, seconds):\n"
+    // [PROFILE] Per-phase summary across all blocks.
+    diskann::cout << "[PROFILE] Per-phase wall-clock totals (seconds, summed across "
+                  << num_blocks << " blocks):\n"
                   << "  io_read           = " << t_io_read << "\n"
                   << "  convert_types     = " << t_convert << "\n"
                   << "  compute_distance  = " << t_dist << "\n"
-                  << "  reset_state       = " << t_reset << "\n"
-                  << "  round1            = " << t_round1 << "\n"
-                  << "  flush_r1          = " << t_flush_r1 << "\n"
-                  << "  radius_reduce     = " << t_radius_reduce << "\n"
+                  << "  round1_assign     = " << t_round1 << "\n"
                   << "  data_dist_update  = " << t_data_dist << "\n"
-                  << "  round2            = " << t_round2 << "\n"
-                  << "  flush_r2          = " << t_flush_r2 << "\n"
-                  << "  merge_sort_write  = " << t_merge_sort_write << "\n"
-                  << "  bookkeeping       = " << t_bookkeeping << "\n"
+                  << "  round2_assign     = " << t_round2 << "\n"
+                  << "  sort_per_shard    = " << t_sort << "\n"
+                  << "  write_per_shard   = " << t_write << "\n"
                   << "  block_loop_total  = "
-                  << (t_io_read + t_convert + t_dist + t_reset + t_round1
-                      + t_flush_r1 + t_radius_reduce + t_data_dist
-                      + t_round2 + t_flush_r2 + t_merge_sort_write + t_bookkeeping)
-                  << std::endl;
+                  << (t_io_read + t_convert + t_dist + t_round1 + t_data_dist
+                      + t_round2 + t_sort + t_write) << "\n"
+                  << "  setup_to_block_loop_end_wall = "
+                  << (t_block_loop_end - t_setup_start) << std::endl;
 
-    // [B1 DIAG] Per-shard close() timing — to identify if disk flush at close()
-    //   is the source of the post-block-loop slowdown.
+    // [PROFILE] Per-shard close() timing — close() blocks until OS finishes
+    //   writing this file's dirty pages. Long close times indicate the data was
+    //   still in page cache (not yet on disk) when the block loop ended.
     size_t total_count = 0;
-    diskann::cout << "Actual shard sizes:\n";
-    std::string sizes_filename = prefix_path + "/partition_sizes.txt";
-    std::ofstream sizes_writer(sizes_filename);
-    sizes_writer << "# partition_id num_points\n";
+    diskann::cout << "Actual shard sizes:" << std::endl;
     double t_finalize_start = __now();
     for (size_t i = 0; i < num_centers; i++)
     {
         double __ts = __now();
         uint32_t cur_shard_count = (uint32_t)shard_counts[i].load_relaxed();
         total_count += cur_shard_count;
-        sizes_writer << i << " " << cur_shard_count << "\n";
-        double __t_seek_start = __now();
         shard_data_writer[i].seekp(0);
         shard_data_writer[i].write((char *)&cur_shard_count, sizeof(uint32_t));
-        double __t_close_data_start = __now();
+        double __tc_d0 = __now();
         shard_data_writer[i].close();
-        double __t_close_data_end = __now();
+        double __tc_d1 = __now();
         shard_idmap_writer[i].seekp(0);
         shard_idmap_writer[i].write((char *)&cur_shard_count, sizeof(uint32_t));
-        double __t_close_idmap_start = __now();
+        double __tc_i0 = __now();
         shard_idmap_writer[i].close();
-        double __t_close_idmap_end = __now();
+        double __tc_i1 = __now();
         diskann::cout << "  shard[" << i << "] count=" << cur_shard_count
-                      << " seek+writeHdr=" << (__t_close_data_start - __t_seek_start)
-                      << "s close_data=" << (__t_close_data_end - __t_close_data_start)
-                      << "s close_idmap=" << (__t_close_idmap_end - __t_close_idmap_start)
-                      << "s total=" << (__now() - __ts) << "s" << std::endl;
+                      << " close_data=" << (__tc_d1 - __tc_d0) << "s"
+                      << " close_idmap=" << (__tc_i1 - __tc_i0) << "s"
+                      << " total=" << (__now() - __ts) << "s" << std::endl;
     }
-    sizes_writer << "# total " << total_count << "\n";
-    sizes_writer << "# num_input_points " << num_points << "\n";
-    sizes_writer << "# replication_factor " << k_base << "\n";
-    sizes_writer.close();
-    double t_finalize_end = __now();
-    diskann::cout << "[B1 DIAG] Total finalize loop (close all shards) = "
-                  << (t_finalize_end - t_finalize_start) << " seconds" << std::endl;
+    diskann::cout << "[PROFILE] Total finalize loop (all closes, serial) = "
+                  << (__now() - t_finalize_start) << " seconds" << std::endl;
 
     diskann::cout << " (ScaleGANN) Partitioned " << num_points << " with replication factor " << k_base << " to get "
                   << total_count << " points across " << num_centers << " shards " << std::endl;
-    double t_before_delete = __now();
     delete[] distance_matrix;
-    diskann::cout << "[B1 DIAG] delete[] distance_matrix took "
-                  << (__now() - t_before_delete) << " seconds" << std::endl;
-    // After this `}`, all local vectors (local_buf, sort_scratch, etc.) destruct.
-    diskann::cout << "[B1 DIAG] About to exit function — local vector destructors will run now." << std::endl;
 }
 
 template <typename T>
@@ -1254,10 +989,7 @@ void diskANN_partitions_with_ram_budget(const std::string data_file, double samp
     uint32_t dim32;
     head_reader.read((char *)&npts32, sizeof(uint32_t));
     head_reader.read((char *)&dim32, sizeof(uint32_t));
-    // [SAMPLE-FIX] Use SAMPLE_BASE (256K) — same value DiskANN itself uses
-    //   for k-means training (was MAX_SAMPLE_FOR_KMEANS_TRAINING constant
-    //   before the refactor; the value is identical).
-    sampling_rate = ((double)SAMPLE_BASE / (double)npts32);
+    sampling_rate=((double)MAX_SAMPLE_FOR_KMEANS_TRAINING / (double) npts32);
     printf("Adjusting DiskANN sampling rate to %f\n", sampling_rate);
 
     gen_random_slice<T>(data_file, sampling_rate, train_data_float, num_train, train_dim);
@@ -1290,15 +1022,8 @@ void diskANN_partitions_with_ram_budget(const std::string data_file, double samp
         pivot_data = new float[num_parts * train_dim];
         // Process Global k-means for kmeans_partitioning Step
         diskann::cout << "Processing global k-means (kmeans_partitioning Step)" << std::endl;
-        // kmeans++ initialization stays on DiskANN's reference impl (we only
-        // optimized the Lloyd iterations, not the kmeans++ pivot selection).
         kmeans::kmeanspp_selecting_pivots(train_data_float, num_train, train_dim, pivot_data, num_parts);
-        // [SAMPLE-FIX] Replaced kmeans::run_lloyds (DiskANN reference) with the
-        //   optimized kmeans_cpu::run_lloyds_opt — same algorithm + math, but
-        //   with three CPU parallelism fixes (no critical-section serialization,
-        //   point-parallel centroid update, no broadcast-via-SGEMM).
-        //   See src/partition/kmeans_cpu.h for details.
-        kmeans_cpu::run_lloyds_opt(train_data_float, num_train, train_dim, pivot_data, num_parts, max_k_means_reps, NULL, NULL);
+        kmeans::run_lloyds(train_data_float, num_train, train_dim, pivot_data, num_parts, max_k_means_reps, NULL, NULL);
 
         // now pivots are ready. need to stream base points and assign them to
         // closest clusters.
@@ -1342,116 +1067,36 @@ template <typename T>
 void scaleGANN_partitions_with_ram_budget(const std::string data_file, double sampling_rate, double ram_budget,
         size_t graph_degree, uint32_t inter_degree, uint32_t threads,
         const std::string prefix_path, size_t k_base, uint32_t num_parts = 0, float epsilon=2, size_t max_k_means_reps = 15){
-    // [PROFILE-WRAPPER] Wrapper-level phase timing. _rankSequential below has
-    //   its own [PROFILE] block-loop breakdown; this captures everything
-    //   AROUND it (header read, gen_random_slice, k-means, save centroids, etc.).
-    auto __now = []() {
-        return std::chrono::duration<double>(
-            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
-    };
-    double t_header = 0, t_gen_slice = 0, t_kmeanspp = 0, t_lloyds = 0;
-    double t_save_pivots = 0, t_rank_sequential = 0, t_cleanup = 0;
-    double t_wrap_start = __now();
-
-    double __t = __now();
     size_t read_blk_size = 64 * 1024 * 1024;
     cached_ifstream base_reader(data_file, read_blk_size);
     uint32_t npts32;
     uint32_t basedim32;
     base_reader.read((char *)&npts32, sizeof(uint32_t));
     base_reader.read((char *)&basedim32, sizeof(uint32_t));
-
+    
     // Lan: todo: if partition-num == 1
     uint32_t partition_lower_bound = 0;
     uint32_t size_limit = (uint32_t) npts32;
     get_partition_num<T>(ram_budget, npts32, basedim32, graph_degree, inter_degree, threads, k_base, &partition_lower_bound, &size_limit);
     // uint32_t size_limit = (uint32_t) (1 + k_base * npts32 / partition_lower_bound);
     num_parts = partition_lower_bound > num_parts ? partition_lower_bound : num_parts;
-    t_header = __now() - __t;
 
-    // [PROFILE-WRAPPER] gen_random_slice: streams the whole dataset once to
-    //   sample `num_train` rows for k-means training. I/O dominated.
-    __t = __now();
     size_t train_dim;
     size_t num_train;
     float *train_data_float;
-    // [SAMPLE-FIX, scheme B] Adaptive sample-size cap.
-    //   target_sample = clamp(num_parts * SAMPLE_PER_CLUSTER,
-    //                         SAMPLE_BASE, KMEANSPP_HARD_LIMIT)
-    //   Then convert to p_val and cap user's request if too high.
-    //
-    //   If num_parts > KMEANSPP_HARD_LIMIT / SAMPLE_PER_CLUSTER (≈ 8388 with
-    //   current constants), the naive target would exceed the k-means++
-    //   algorithm cap. We choose to cap at KMEANSPP_HARD_LIMIT — k-means++
-    //   keeps working with full quality, at the cost of fewer than
-    //   SAMPLE_PER_CLUSTER samples per cluster. A warning is printed so the
-    //   user knows quality may be marginally affected.
-    {
-        size_t naive_target = (size_t)num_parts * SAMPLE_PER_CLUSTER;
-        size_t target_sample = naive_target;
-        if (target_sample < SAMPLE_BASE)         target_sample = SAMPLE_BASE;
-        bool capped_by_hard_limit = false;
-        if (target_sample > KMEANSPP_HARD_LIMIT) {
-            target_sample = KMEANSPP_HARD_LIMIT;
-            capped_by_hard_limit = true;
-        }
-        if (target_sample > (size_t)npts32)      target_sample = (size_t)npts32;
-        double max_p_val = (double)target_sample / (double)npts32;
-        if (sampling_rate > max_p_val) {
-            sampling_rate = max_p_val;
-        }
-        diskann::cout << "[SAMPLE-FIX] num_parts=" << num_parts
-                      << ", target_sample=" << target_sample
-                      << ", effective_sampling_rate=" << sampling_rate
-                      << " (estimated num_train=" << (size_t)(sampling_rate * npts32) << ")"
-                      << std::endl;
-        if (capped_by_hard_limit) {
-            double samples_per_cluster_actual = (double)target_sample / (double)num_parts;
-            diskann::cout << "[SAMPLE-FIX WARNING] num_parts=" << num_parts
-                          << " * SAMPLE_PER_CLUSTER=" << SAMPLE_PER_CLUSTER
-                          << " = " << naive_target
-                          << " exceeds k-means++ hard limit "
-                          << KMEANSPP_HARD_LIMIT << " (=1<<23). "
-                          << "Capped at the limit; effective samples/cluster ~ "
-                          << samples_per_cluster_actual
-                          << " (target was " << SAMPLE_PER_CLUSTER << "). "
-                          << "Going above the limit would force DiskANN's "
-                          << "kmeans++ to fall back to random pivot selection "
-                          << "(see DiskANN/src/math_utils.cpp:448), which "
-                          << "degrades clustering quality more than the "
-                          << "reduced samples/cluster does. Consider lowering "
-                          << "num_parts if cluster quality matters for your use case."
-                          << std::endl;
-        }
+    if (sampling_rate > ((double)MAX_SAMPLE / npts32)){
+        sampling_rate = (double)MAX_SAMPLE / npts32;
     }
     gen_random_slice<T>(data_file, sampling_rate, train_data_float, num_train, train_dim);
-    t_gen_slice = __now() - __t;
 
     float *pivot_data = nullptr;
     pivot_data = new float[num_parts * train_dim];
     // Process Global k-means for kmeans_partitioning Step
     diskann::cout << "Processing global k-means (kmeans_partitioning Step)" << std::endl;
-    // [PROFILE-WRAPPER] kmeans++ pivot seed selection (CPU).
-    __t = __now();
     // Lan: todo: use GPU Kmeans clustering
     kmeans::kmeanspp_selecting_pivots(train_data_float, num_train, train_dim, pivot_data, num_parts);
-    t_kmeanspp = __now() - __t;
+    kmeans::run_lloyds(train_data_float, num_train, train_dim, pivot_data, num_parts, max_k_means_reps, NULL, NULL);
 
-    // [PROFILE-WRAPPER] Lloyd iterations.
-    //   Was: kmeans::run_lloyds (DiskANN reference, CPU).
-    //   Now: kmeans_cpu::run_lloyds_opt — same algorithm + math, three
-    //   parallelism fixes:
-    //     1. inverted-index update without #pragma omp critical (was the
-    //        biggest bottleneck — 8.4M serialized push_back calls per iter)
-    //     2. centroid update parallelized over points, not clusters
-    //        (with K=10 and T=80, reference left 70 threads idle)
-    //     3. distance-matrix prep without two broadcast SGEMMs
-    //   See src/partition/kmeans_cpu.h for details and correctness notes.
-    __t = __now();
-    kmeans_cpu::run_lloyds_opt(train_data_float, num_train, train_dim, pivot_data, num_parts, max_k_means_reps, NULL, NULL);
-    t_lloyds = __now() - __t;
-
-    __t = __now();
     std::string cur_file = std::string(prefix_path);
     ensure_directory_exists(prefix_path);
     std::string output_file;
@@ -1459,34 +1104,13 @@ void scaleGANN_partitions_with_ram_budget(const std::string data_file, double sa
 
     diskann::cout << "Saving global k-center pivots" << std::endl;
     diskann::save_bin<float>(output_file.c_str(), pivot_data, (size_t)num_parts, train_dim);
-    t_save_pivots = __now() - __t;
 
-    // [PROFILE-WRAPPER] The main per-block assignment + sort + write phase.
-    //   Its internal [PROFILE] print breaks this down further per block-loop
-    //   sub-phase (io_read, convert, dist, round1/2, sort, write, close).
-    __t = __now();
     // scaleGANN_shard_data_into_clusters_with_ram_budget<T>(data_file, pivot_data, num_parts, train_dim, k_base, size_limit, prefix_path, epsilon);
     scaleGANN_shard_data_into_clusters_with_ram_budget_rankSequential<T>(data_file, pivot_data, num_parts, train_dim, k_base, size_limit, prefix_path, epsilon);
     // SOGAIC_shard_data_into_clusters_with_ram_budget<T>(data_file, pivot_data, num_parts, train_dim, k_base, size_limit, prefix_path, epsilon);
     // scaleGANN_non_selective_shard_with_ram_budget<T>(data_file, pivot_data, num_parts, train_dim, k_base, size_limit, prefix_path);
-    t_rank_sequential = __now() - __t;
-
-    __t = __now();
     delete[] pivot_data;
     delete[] train_data_float;
-    t_cleanup = __now() - __t;
-
-    double t_wrap_total = __now() - t_wrap_start;
-    diskann::cout << "\n[PROFILE-WRAPPER] scaleGANN_partitions_with_ram_budget phase timings (seconds):\n"
-                  << "  header_read+get_partition_num = " << t_header        << "\n"
-                  << "  gen_random_slice              = " << t_gen_slice     << "\n"
-                  << "  kmeanspp_selecting_pivots     = " << t_kmeanspp      << "\n"
-                  << "  run_lloyds                    = " << t_lloyds        << "\n"
-                  << "  save_centroids                = " << t_save_pivots   << "\n"
-                  << "  rank_sequential_total         = " << t_rank_sequential
-                  << "   (see [PROFILE] above for inner block-loop breakdown)\n"
-                  << "  free_buffers                  = " << t_cleanup       << "\n"
-                  << "  wrapper_total                 = " << t_wrap_total    << std::endl;
 }
 
 
