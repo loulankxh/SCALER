@@ -69,3 +69,35 @@ Build data with details are in folder [experiments]().
 ## Search experiments
 We record full search results including recall, time and query latency in [search results](https://docs.google.com/spreadsheets/d/1_rdrr2zPHzPDIhlvdY1N7BzFtH-y-3tpIPgv03B6Tw8/edit?usp=sharing). 
 For more details, also see in folder [experiments]().
+
+# Task Scheduler & Transient GPU Simulation
+
+ScaleGANN includes a transient-aware task scheduler designed to manage index shard building across a fluctuating pool of GPUs (e.g., Spot or Preemptible instances in cloud environments).
+
+The scheduler prioritizes scheduling of tasks with higher retry counts (interrupted tasks) to prevent resource starvation and minimize wasted computation.
+
+## Directory Structure
+- [src/taskScheduler/TaskBroker.hpp](src/taskScheduler/TaskBroker.hpp) / [src/taskScheduler/TaskBroker.cpp](src/taskScheduler/TaskBroker.cpp): Core scheduler engine and task broker.
+- [tests/TraceSimulator.hpp](tests/TraceSimulator.hpp) / [tests/test_Simulation.cpp](tests/test_Simulation.cpp): Trace-driven simulation framework.
+- [run_pipeline.py](run_pipeline.py): Main benchmarking pipeline orchestrator script.
+- [SchedulerArtifacts/](SchedulerArtifacts/): Folder holding GPU availability traces, simulation log outputs, and plots.
+
+## How to Build & Run Simulation
+1. **Build the Simulator**:
+   ```bash
+   mkdir -p build && cd build
+   cmake -DCMAKE_BUILD_TYPE=Release ..
+   make -j testSimulation
+   cd ..
+   ```
+2. **Run Benchmarking Pipeline**:
+   ```bash
+   ./scaleGANN/bin/python run_pipeline.py
+   ```
+   This runs the simulator for multiple transient scenarios (Original Trace, High Volatility, Burst Arrivals, Sustained Capacity), aggregates statistics, and generates comparative plots under `SchedulerArtifacts/benchmark_results/`.
+
+3. **Plot-Only Mode**:
+   To regenerate charts from cached simulation outputs:
+   ```bash
+   ./scaleGANN/bin/python run_pipeline.py --plot-only
+   ```

@@ -1,9 +1,9 @@
 Scenario,Policy,Duration
-Original Trace,Retry-Prioritized,37287.600000000006
-Original Trace,Random Baseline,75117.19999999998
-Scenario A High Volatility,Retry-Prioritized,50668.799999999996
-Scenario A High Volatility,Random Baseline,45830.51666666666
-Scenario B Burst Arrivals,Retry-Prioritized,36752.99999999997
-Scenario B Burst Arrivals,Random Baseline,51218.40000000001
-Scenario C Sustained Capacity,Retry-Prioritized,29819.000000000004
-Scenario C Sustained Capacity,Random Baseline,35186.60000000001
+Original Trace,Retry-Prioritized,37328.2
+Original Trace,Random Baseline,80393.20000000001
+Scenario A High Volatility,Retry-Prioritized,44227.866666666654
+Scenario A High Volatility,Random Baseline,47911.78333333333
+Scenario B Burst Arrivals,Retry-Prioritized,36651.8
+Scenario B Burst Arrivals,Random Baseline,52048.400000000016
+Scenario C Sustained Capacity,Retry-Prioritized,29755.80000000001
+Scenario C Sustained Capacity,Random Baseline,35207.39999999999
