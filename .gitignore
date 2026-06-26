@@ -80,3 +80,7 @@ rmm_log.txt
 
 # other files
 DiskANN_mainRepo/
+
+# Python Virtual Environments
+scaleGANN/
+
